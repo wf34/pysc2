@@ -522,8 +522,9 @@ class Features(object):
           # TODO(tewalds): After looking at some replays we should decide if
           # this is good enough. Maybe we need to simulate multiple actions or
           # merge the selection rects into a bigger one.
-          logging.info("Multi-rect selection, just using the first one:\n%s",
-                       select_rect.selection_screen_coord)
+          # logging.info("Multi-rect selection, just using the first one:\n%s",
+          #              select_rect.selection_screen_coord)
+          pass
         tl = point.Point.build(select_rect.selection_screen_coord[0].p0)
         br = point.Point.build(select_rect.selection_screen_coord[0].p1)
         return func_call_name("select_rect", [[select_rect.selection_add],

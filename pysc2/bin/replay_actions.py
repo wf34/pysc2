@@ -31,10 +31,12 @@ import six
 from six.moves import queue
 
 from pysc2 import run_configs
+from pysc2.lib import actions
 from pysc2.lib import features
 from pysc2.lib import point
 from pysc2.lib import protocol
 from pysc2.lib import remote_controller
+from pysc2.third_party import game_dumper
 
 from absl import app
 from absl import flags
@@ -47,7 +49,11 @@ flags.DEFINE_integer("parallel", 1, "How many instances to run in parallel.")
 flags.DEFINE_integer("step_mul", 8, "How many game steps per observation.")
 flags.DEFINE_string("replays", None, "Path to a directory of replays.")
 flags.mark_flag_as_required("replays")
-
+flags.DEFINE_string("game_data_destination",
+                    None,
+                    "Path to a destination directory for the serialized replay data")
+flags.mark_flag_as_required("game_data_destination")
+flags.DEFINE_integer("print_time", 300, "Interval between stat prints and data saves in seconds")
 
 size = point.Point(16, 16)
 interface = sc_pb.InterfaceOptions(
@@ -162,6 +168,25 @@ def valid_replay(info, ping):
       return False
   return True
 
+class stepper():
+  """Helper class for replay_simulation"""
+  def __init__(self, step_function):
+    self.step_ = 0
+    self.step_function = step_function
+
+  def step(self, count = 1):
+    self.step_function(count)
+    self.step_ += count
+
+def call_dump_callbacks(dump_callbacks, step, observation, uscore, actions):
+  """Calls callbacks for X and Y_action for every step;
+                               Y_uscore - only for the first step of replay
+  """
+  for type_, datum in zip(game_dumper.game_dumper.game_data_types,
+                          [observation, uscore, actions]):
+    if type_ == 'Y_uscore' and step != 1:
+        continue
+    dump_callbacks[type_](step, datum)
 
 class ReplayProcessor(multiprocessing.Process):
   """A Process that pulls replays and processes them."""
@@ -177,6 +202,7 @@ class ReplayProcessor(multiprocessing.Process):
     signal.signal(signal.SIGTERM, lambda a, b: sys.exit())  # Exit quietly.
     self._update_stage("spawn")
     replay_name = "none"
+    dumper = game_dumper.game_dumper(FLAGS.game_data_destination)
     while True:
       self._print("Starting up a new SC2 instance.")
       self._update_stage("launch")
@@ -215,8 +241,11 @@ class ReplayProcessor(multiprocessing.Process):
                 for player_id in [1, 2]:
                   self._print("Starting %s from player %s's perspective" % (
                       replay_name, player_id))
+                  dump_callbacks = dumper.get_dump_callbacks(replay_name,
+                                                             player_id)
                   self.process_replay(controller, replay_data, map_data,
-                                      player_id)
+                                      player_id,
+                                      dump_callbacks, info)
               else:
                 self._print("Replay is invalid.")
                 self.stats.replay_stats.invalid_replays.add(replay_name)
@@ -237,8 +266,15 @@ class ReplayProcessor(multiprocessing.Process):
     self.stats.update(stage)
     self.stats_queue.put(self.stats)
 
-  def process_replay(self, controller, replay_data, map_data, player_id):
+  
+
+  def process_replay(self, controller, replay_data,
+                     map_data, player_id, dump_callbacks, info):
     """Process a single replay, updating the stats."""
+    match_result = info.player_info[player_id-1].player_result.result
+    assert match_result in [1, 2]
+    uscore = {1 : 'Victory', 2 : 'Defeat'}[match_result]
+    
     self._update_stage("start_replay")
     controller.start_replay(sc_pb.RequestStartReplay(
         replay_data=replay_data,
@@ -250,12 +286,15 @@ class ReplayProcessor(multiprocessing.Process):
 
     self.stats.replay_stats.replays += 1
     self._update_stage("step")
-    controller.step()
+    
+    replay_stepper = stepper(controller.step)
+    replay_stepper.step()
     while True:
       self.stats.replay_stats.steps += 1
       self._update_stage("observe")
       obs = controller.observe()
 
+      actions_performed = []
       for action in obs.actions:
         act_fl = action.action_feature_layer
         if act_fl.HasField("unit_command"):
@@ -271,10 +310,12 @@ class ReplayProcessor(multiprocessing.Process):
           self.stats.replay_stats.control_group += 1
 
         try:
-          func = feat.reverse_action(action).function
+          func = feat.reverse_action(action)
         except ValueError:
-          func = -1
-        self.stats.replay_stats.made_actions[func] += 1
+          func = actions.FunctionCall(-1, [])
+            
+        self.stats.replay_stats.made_actions[func.function] += 1
+        actions_performed.append(func)
 
       for valid in obs.observation.abilities:
         self.stats.replay_stats.valid_abilities[valid.ability_id] += 1
@@ -285,11 +326,18 @@ class ReplayProcessor(multiprocessing.Process):
       for ability_id in feat.available_actions(obs.observation):
         self.stats.replay_stats.valid_actions[ability_id] += 1
 
+      observation = feat.transform_obs(obs.observation)
+
+      call_dump_callbacks(dump_callbacks,
+                          replay_stepper.step_,
+                          observation,
+                          uscore,
+                          actions_performed)
       if obs.player_result:
         break
 
       self._update_stage("step")
-      controller.step(FLAGS.step_mul)
+      replay_stepper.step(FLAGS.step_mul)
 
 
 def stats_printer(stats_queue):
@@ -300,7 +348,7 @@ def stats_printer(stats_queue):
 
   running = True
   while running:
-    print_time += 10
+    print_time += FLAGS.print_time
 
     while time.time() < print_time:
       try:
